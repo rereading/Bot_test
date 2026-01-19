@@ -1,0 +1,932 @@
+=== bot/__init__.py ===
+# Пустой файл
+
+=== bot/states.py ===
+from aiogram.fsm.state import StatesGroup, State
+
+
+class HelpFSM(StatesGroup):
+    language = State()
+    description = State()
+    filial = State()
+
+=== bot/services/__init__.py ===
+# Пустой файл
+
+=== bot/services/pyrus_service.py ===
+from typing import Dict, Any
+import httpx
+from bot.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class PyrusService:
+    """Сервис для работы с Pyrus API"""
+    
+    def __init__(self):
+        self.api_key = settings.PYRUS_API_KEY
+        self.base_url = settings.PYRUS_API_URL
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+    
+    async def create_task(self, data: Dict[str, Any]) -> str | None:
+        """Создать задачу в Pyrus"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/tasks",
+                    json=data,
+                    headers=self.headers
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    task_id = result.get("task", {}).get("id")
+                    if task_id:
+                        logger.info(f"Задача создана: {task_id}")
+                        return str(task_id)
+                    else:
+                        logger.error("Не удалось получить ID задачи")
+                        return None
+                else:
+                    logger.error(f"Ошибка создания задачи: {response.status_code} - {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Ошибка при создании задачи: {e}")
+            return None
+
+
+pyrus_service = PyrusService()
+
+=== bot/services/i18n_service.py ===
+from bot.locales.translations import translations
+from typing import Dict, Any
+
+
+class I18nService:
+    """Сервис для интернационализации"""
+    
+    def __init__(self):
+        self.translations = translations
+    
+    def get_text(self, key: str, language: str = "ru") -> str:
+        """Получить текст по ключу и языку"""
+        lang_data = self.translations.get(language, self.translations.get("ru", {}))
+        return lang_data.get(key, key)
+    
+    def format_text(self, key: str, language: str = "ru", **kwargs) -> str:
+        """Форматировать текст с параметрами"""
+        text = self.get_text(key, language)
+        return text.format(**kwargs)
+
+
+i18n_service = I18nService()
+
+=== bot/services/group_service.py ===
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update, insert, delete
+from typing import List, Optional
+from bot.models.group import Group
+from bot.models.filial import Filial
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class GroupService:
+    """Сервис для работы с группами"""
+    
+    @staticmethod
+    async def get_or_create_group(
+        session: AsyncSession,
+        group_id: int,
+        group_name: str
+    ) -> tuple[Group, bool]:
+        """Получить или создать группу"""
+        # Попытка найти существующую группу
+        result = await session.execute(
+            select(Group).where(Group.group_id == group_id)
+        )
+        group = result.scalar_one_or_none()
+        
+        if group:
+            # Обновить имя группы, если изменилось
+            if group.group_name != group_name:
+                group.group_name = group_name
+                await session.commit()
+            return group, False
+        
+        # Создать новую группу
+        group = Group(
+            group_id=group_id,
+            group_name=group_name
+        )
+        session.add(group)
+        await session.commit()
+        await session.refresh(group)
+        
+        logger.info(f"Создана новая группа: {group_name} ({group_id})")
+        return group, True
+    
+    @staticmethod
+    async def set_premium(session: AsyncSession, group_id: int, is_premium: bool) -> bool:
+        """Установить премиум статус группы"""
+        result = await session.execute(
+            update(Group)
+            .where(Group.id == group_id)
+            .values(is_premium=is_premium)
+        )
+        await session.commit()
+        return result.rowcount > 0
+    
+    @staticmethod
+    async def get_group(session: AsyncSession, group_id: int) -> Optional[Group]:
+        """Получить группу по ID"""
+        result = await session.execute(
+            select(Group).where(Group.group_id == group_id)
+        )
+        return result.scalar_one_or_none()
+    
+    @staticmethod
+    async def get_filials(session: AsyncSession, group_id: int) -> List[Filial]:
+        """Получить филиалы группы"""
+        result = await session.execute(
+            select(Filial).where(Filial.group_id == group_id)
+        )
+        return list(result.scalars().all())
+    
+    @staticmethod
+    async def add_filial(session: AsyncSession, group_id: int, filial_name: str) -> Optional[Filial]:
+        """Добавить филиал группе"""
+        # Проверить, существует ли группа
+        group = await GroupService.get_group(session, group_id)
+        if not group:
+            return None
+        
+        # Создать филиал
+        filial = Filial(
+            group_id=group.id,
+            name=filial_name
+        )
+        session.add(filial)
+        await session.commit()
+        await session.refresh(filial)
+        
+        # Обновить флаг has_filials
+        await session.execute(
+            update(Group)
+            .where(Group.id == group.id)
+            .values(has_filials=True)
+        )
+        await session.commit()
+        
+        logger.info(f"Добавлен филиал '{filial_name}' к группе {group_id}")
+        return filial
+
+=== bot/models/__init__.py ===
+# Пустой файл
+
+=== bot/models/group.py ===
+from __future__ import annotations
+
+from sqlalchemy import Boolean, BigInteger, String, DateTime
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.sql import func
+from datetime import datetime
+from typing import List, TYPE_CHECKING
+from bot.database import Base
+
+if TYPE_CHECKING:
+    from .filial import Filial
+
+
+class Group(Base):
+    __tablename__ = "groups"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    group_name: Mapped[str] = mapped_column(String(255))
+    is_premium: Mapped[bool] = mapped_column(Boolean, default=False)
+    has_filials: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now()
+    )
+
+    filials: Mapped[List["Filial"]] = relationship(
+        "Filial",
+        back_populates="group",
+        cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:
+        return f"<Group {self.group_name}>"
+
+=== bot/models/filial.py ===
+from __future__ import annotations
+
+from sqlalchemy import ForeignKey, String, DateTime
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.sql import func
+from datetime import datetime
+from typing import TYPE_CHECKING
+from bot.database import Base
+
+if TYPE_CHECKING:
+    from .group import Group
+
+
+class Filial(Base):
+    __tablename__ = "filials"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"),
+        index=True
+    )
+    name: Mapped[str] = mapped_column(String(255))
+    pyrus_field_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+
+    group: Mapped["Group"] = relationship("Group", back_populates="filials")
+    
+    def __repr__(self) -> str:
+        return f"<Filial {self.name}>"
+
+=== bot/middlewares/__init__.py ===
+# Пустой файл
+
+=== bot/middlewares/language.py ===
+"""
+Middleware для автоматической установки языка из FSM
+После выбора языка пользователем, он автоматически внедряется во все handlers
+"""
+
+from typing import Callable, Dict, Any, Awaitable
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+from aiogram.fsm.context import FSMContext
+
+
+class LanguageMiddleware(BaseMiddleware):
+    """Middleware для автоматической установки языка из FSM"""
+    
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]], 
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        # Получаем state
+        state: FSMContext | None = data.get("state")
+        
+        # Язык по умолчанию
+        language = "ru"
+        
+        # Пытаемся получить язык из FSM
+        if state:
+            state_data = await state.get_data()
+            language = state_data.get("language", "ru")
+        
+        # Внедряем язык в data для использования в handlers
+        data["language"] = language
+        
+        return await handler(event, data)
+
+=== bot/middlewares/db.py ===
+from typing import Callable, Dict, Any, Awaitable
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+from sqlalchemy.ext.asyncio import AsyncSession
+from bot.database import db
+
+
+class DatabaseMiddleware(BaseMiddleware):
+    """Middleware для внедрения сессии БД"""
+    
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]], 
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        async for session in db.get_session():
+            data["session"] = session
+            return await handler(event, data)
+
+=== bot/middlewares/admin.py ===
+from typing import Callable, Dict, Any, Awaitable
+from aiogram import BaseMiddleware
+from aiogram.types import Message
+from bot.config import settings
+
+
+class AdminMiddleware(BaseMiddleware):
+    """Middleware для проверки прав администратора"""
+    
+    async def __call__(
+        self,
+        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]], 
+        event: Message,
+        data: Dict[str, Any]
+    ) -> Any:
+        if event.from_user is None:
+            await event.answer("❌ Ошибка: пользователь не найден")
+            return
+        
+        if event.from_user.id not in settings.admin_ids_list:
+            await event.answer("⛔ У вас нет прав администратора")
+            return
+        
+        return await handler(event, data)
+
+=== bot/main.py ===
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from bot.config import settings
+from bot.database import db
+from bot.middlewares.db import DatabaseMiddleware
+from bot.middlewares.language import LanguageMiddleware
+from bot.handlers import router
+import sys
+
+# Настройка логирования
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL.upper()),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log', encoding='utf-8')
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+
+async def main():
+    """Главная функция"""
+    logger.info("Запуск бота...")
+    
+    # Инициализация бота
+    bot = Bot(
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML")
+    )
+    
+    # Инициализация диспетчера
+    dp = Dispatcher()
+    
+    # Подключение middleware
+    dp.update.middleware(DatabaseMiddleware())
+    dp.update.middleware(LanguageMiddleware())
+    
+    # Подключение роутеров
+    dp.include_router(router)
+    
+    # Создание таблиц БД
+    await db.create_tables()
+    
+    logger.info("Бот запущен!")
+    
+    # Запуск polling
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+        sys.exit(1)
+
+=== bot/locales/__init__.py ===
+# Пустой файл
+
+=== bot/locales/translations.py ===
+translations = {
+    "ru": {
+        "welcome": "Добро пожаловать!",
+        "choose_language": "Выберите язык:",
+        "enter_description": "Опишите проблему:",
+        "choose_filial": "Выберите филиал:",
+        "request_created": "Заявка создана!",
+        "error": "Произошла ошибка"
+    },
+    "uz": {
+        "welcome": "Xush kelibsiz!",
+        "choose_language": "Tilni tanlang:",
+        "enter_description": "Muammoni tavsiflang:",
+        "choose_filial": "Filialni tanlang:",
+        "request_created": "Murojaat yaratildi!",
+        "error": "Xatolik yuz berdi"
+    },
+    "en": {
+        "welcome": "Welcome!",
+        "choose_language": "Choose language:",
+        "enter_description": "Describe the problem:",
+        "choose_filial": "Choose branch:",
+        "request_created": "Request created!",
+        "error": "An error occurred"
+    }
+}
+
+=== bot/keyboards/__init__.py ===
+# Пустой файл
+
+=== bot/keyboards/language.py ===
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+
+def language_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора языка"""
+    keyboard = [
+        [
+            InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
+            InlineKeyboardButton(text="🇺🇿 O'zbek", callback_data="lang_uz"),
+            InlineKeyboardButton(text="🇺🇸 English", callback_data="lang_en")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+=== bot/keyboards/filials.py ===
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from typing import List
+from bot.models.filial import Filial
+
+
+def filials_keyboard(filials: List[Filial]) -> InlineKeyboardMarkup:
+    """Клавиатура выбора филиала"""
+    keyboard = []
+    
+    for filial in filials:
+        keyboard.append([
+            InlineKeyboardButton(
+                text=filial.name,
+                callback_data=f"filial_{filial.id}"
+            )
+        ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+=== bot/handlers/__init__.py ===
+from . import admin, group_events, help_flow
+
+__all__ = ["admin", "group_events", "help_flow"]
+
+=== bot/handlers/admin.py ===
+from aiogram import Router
+from aiogram.filters import Command
+from aiogram.types import Message
+from sqlalchemy.ext.asyncio import AsyncSession
+from bot.services.group_service import GroupService
+from bot.middlewares.admin import AdminMiddleware
+import logging
+
+logger = logging.getLogger(__name__)
+router = Router()
+router.message.middleware(AdminMiddleware())
+
+
+@router.message(Command("admin_set_premium"))
+async def set_premium(message: Message, session: AsyncSession):
+    """
+    Установить премиум статус группы
+    Формат: /admin_set_premium <group_id> <true/false>
+    """
+    assert message.text is not None  # Гарантировано командой
+    try:
+        args = message.text.split()
+        if len(args) != 3:
+            await message.answer(
+                "⚠️ Формат: /admin_set_premium <group_id> <true/false>"
+            )
+            return
+        
+        group_id = int(args[1])
+        is_premium = args[2].lower() == "true"
+        
+        success = await GroupService.set_premium(session, group_id, is_premium)
+        
+        if success:
+            await message.answer(
+                f"✅ Премиум статус для группы {group_id}: {is_premium}"
+            )
+        else:
+            await message.answer(f"❌ Группа {group_id} не найдена")
+            
+    except ValueError:
+        await message.answer("❌ Некорректный group_id")
+    except Exception as e:
+        logger.error(f"Ошибка установки премиум: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+@router.message(Command("admin_add_filial"))
+async def add_filial(message: Message, session: AsyncSession):
+    """
+    Добавить филиал группе
+    Формат: /admin_add_filial <group_id> <название>
+    """
+    assert message.text is not None  # Гарантировано командой
+    try:
+        args = message.text.split(maxsplit=2)
+        if len(args) != 3:
+            await message.answer(
+                "⚠️ Формат: /admin_add_filial <group_id> <название>"
+            )
+            return
+        
+        group_id = int(args[1])
+        filial_name = args[2]
+        
+        filial = await GroupService.add_filial(session, group_id, filial_name)
+        
+        if filial:
+            await message.answer(
+                f"✅ Филиал '{filial_name}' добавлен группе {group_id}"
+            )
+        else:
+            await message.answer(f"❌ Группа {group_id} не найдена")
+            
+    except ValueError:
+        await message.answer("❌ Некорректный group_id")
+    except Exception as e:
+        logger.error(f"Ошибка добавления филиала: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+
+=== bot/handlers/group_events.py ===
+from aiogram import Router, F
+from aiogram.types import ChatMemberUpdated
+from aiogram.filters import IS_MEMBER, IS_NOT_MEMBER, ChatMemberUpdatedFilter
+from sqlalchemy.ext.asyncio import AsyncSession  # type: ignore
+from bot.services.group_service import GroupService
+import logging
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+@router.chat_member(
+    ChatMemberUpdatedFilter(
+        member_status_changed=IS_NOT_MEMBER >> IS_MEMBER
+    )
+)
+async def on_bot_added(event: ChatMemberUpdated, session: AsyncSession):
+    """Обработчик добавления бота в группу"""
+    assert event.bot is not None  # Убеждаемся, что бот инициализирован
+    
+    if not event.new_chat_member.user.is_bot:
+        return
+    
+    try:
+        group, created = await GroupService.get_or_create_group(
+            session,
+            event.chat.id,
+            event.chat.title or "Неизвестная группа"
+        )
+        
+        welcome_text = (
+            "👋 <b>Добро пожаловать!</b>\n\n"
+            "Я бот технической поддержки компании VedaVector.\n\n"
+            "<b>Как создать заявку:</b>\n"
+            "1. Напишите команду /help\n"
+            "2. Выберите язык\n"
+            "3. Опишите вашу проблему\n\n"
+            "⚠️ <i>Пожалуйста, заполняйте заявку максимально подробно</i>"
+        )
+        
+        msg = await event.bot.send_message(
+            event.chat.id,
+            welcome_text,
+            parse_mode="HTML"
+        )
+        
+        # Закрепляем сообщение (может не быть прав)
+        try:
+            await event.bot.pin_chat_message(event.chat.id, msg.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось закрепить сообщение: {e}")
+        
+        logger.info(f"Бот добавлен в группу: {event.chat.title} ({event.chat.id})")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении бота в группу: {e}")
+
+=== bot/handlers/help_flow.py ===
+from aiogram import Router, F
+from aiogram.filters import Command, StateFilter
+from aiogram.types import Message, CallbackQuery, InaccessibleMessage
+from aiogram.fsm.context import FSMContext
+from sqlalchemy.ext.asyncio import AsyncSession
+from bot.states import HelpFSM
+from bot.keyboards.language import language_keyboard
+from bot.keyboards.filials import filials_keyboard
+from bot.services.group_service import GroupService
+from bot.services.pyrus_service import pyrus_service
+from bot.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+@router.message(Command("help"))
+async def start_help(message: Message, state: FSMContext):
+    """Начало создания заявки"""
+    if message.chat.type == "private":
+        await message.answer(
+            "⚠️ Эта команда работает только в групповых чатах"
+        )
+        return
+    
+    await state.set_state(HelpFSM.language)
+    await message.answer(
+        "🌐 <b>Выберите язык / Tilni tanlang / Choose language:</b>",
+        reply_markup=language_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "cancel")
+async def cancel_help(call: CallbackQuery, state: FSMContext):
+    """Отмена создания заявки"""
+    if call.message is None or isinstance(call.message, InaccessibleMessage):
+        return
+    await state.clear()
+    await call.message.delete()
+    await call.answer("❌ Создание заявки отменено")
+
+
+@router.callback_query(HelpFSM.language, F.data.startswith("lang_"))
+async def choose_language(
+    call: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession
+):
+    """Выбор языка"""
+    if call.message is None or isinstance(call.message, InaccessibleMessage) or call.data is None:
+        return
+    language = call.data.split("_")[1]
+    await state.update_data(language=language)
+    
+    lang_messages = {
+        "ru": "📝 Опишите вашу проблему подробно:",
+        "uz": "📝 Muammoingizni batafsil tasvirlab bering:",
+        "en": "📝 Describe your problem in detail:"
+    }
+    
+    await call.message.edit_text(
+        lang_messages.get(language, lang_messages["ru"])
+    )
+    await state.set_state(HelpFSM.description)
+    await call.answer()
+
+
+@router.message(HelpFSM.description, F.text)
+async def get_description(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession
+):
+    """Получение описания проблемы"""
+    assert message.text is not None  # Гарантировано фильтром F.text
+    description = message.text.strip()
+    
+    # Валидация
+    if len(description) < 10:
+        await message.answer(
+            "⚠️ Описание слишком короткое. Пожалуйста, опишите проблему подробнее."
+        )
+        return
+    
+    if len(description) > settings.MAX_DESCRIPTION_LENGTH:
+        await message.answer(
+            f"⚠️ Описание слишком длинное (максимум {settings.MAX_DESCRIPTION_LENGTH} символов)"
+        )
+        return
+    
+    await state.update_data(description=description)
+    
+    # Удаляем сообщение пользователя для конфиденциальности
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение: {e}")
+    
+    # Проверяем наличие филиалов
+    group = await GroupService.get_group(session, message.chat.id)
+    
+    if not group:
+        await message.answer("❌ Ошибка: группа не найдена в базе данных")
+        await state.clear()
+        return
+    
+    if group.has_filials:
+        filials = await GroupService.get_filials(session, message.chat.id)
+        
+        if filials:
+            await message.answer(
+                "🏢 Выберите филиал:",
+                reply_markup=filials_keyboard(filials)
+            )
+            await state.set_state(HelpFSM.filial)
+        else:
+            await send_to_pyrus(message.bot, message.chat.id, state, session, group)
+    else:
+        await send_to_pyrus(message.bot, message.chat.id, state, session, group)
+
+
+@router.callback_query(HelpFSM.filial, F.data.startswith("filial_"))
+async def choose_filial(
+    call: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession
+):
+    """Выбор филиала"""
+    if call.message is None or isinstance(call.message, InaccessibleMessage) or call.data is None:
+        return
+    filial_id = int(call.data.split("_")[1])
+    
+    # Получаем филиал
+    from bot.models.filial import Filial
+    from sqlalchemy import select
+    
+    result = await session.execute(
+        select(Filial).where(Filial.id == filial_id)
+    )
+    filial = result.scalar_one_or_none()
+    
+    if not filial:
+        await call.answer("❌ Филиал не найден")
+        return
+    
+    await state.update_data(filial=filial.name)
+    
+    # Получаем группу
+    group = await GroupService.get_group(session, call.message.chat.id)
+    
+    await call.message.delete()
+    await send_to_pyrus(call.bot, call.message.chat.id, state, session, group)
+    await call.answer()
+
+
+async def send_to_pyrus(
+    bot,
+    chat_id: int,
+    state: FSMContext,
+    session: AsyncSession,
+    group
+):
+    """Отправка заявки в Pyrus"""
+    data = await state.get_data()
+    
+    # Формируем данные для Pyrus
+    pyrus_data = {
+        "description": data["description"],
+        "language": data["language"],
+        "group_name": group.group_name,
+        "is_premium": group.is_premium,
+        "filial": data.get("filial")
+    }
+    
+    # Создаем задачу
+    task_id = await pyrus_service.create_task(pyrus_data)
+    
+    if task_id:
+        success_messages = {
+            "ru": (
+                "✅ <b>Заявка успешно создана!</b>\n\n"
+                f"Номер заявки: <code>{task_id}</code>\n"
+                "Мы свяжемся с вами в ближайшее время."
+            ),
+            "uz": (
+                "✅ <b>Murojaat muvaffaqiyatli yaratildi!</b>\n\n"
+                f"Murojaat raqami: <code>{task_id}</code>\n"
+                "Yaqin orada siz bilan bog'lanamiz."
+            ),
+            "en": (
+                "✅ <b>Request created successfully!</b>\n\n"
+                f"Request ID: <code>{task_id}</code>\n"
+                "We will contact you soon."
+            )
+        }
+        
+        msg_text = success_messages.get(data["language"], success_messages["ru"])
+        await bot.send_message(chat_id, msg_text, parse_mode="HTML")
+    else:
+        await bot.send_message(
+            chat_id,
+            "❌ Произошла ошибка при создании заявки. Попробуйте позже."
+        )
+    
+    await state.clear()
+
+=== bot/database.py ===
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    async_sessionmaker,
+    AsyncSession,
+    AsyncEngine
+)
+from sqlalchemy.orm import DeclarativeBase
+from typing import AsyncGenerator
+import logging
+from bot.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Database:
+    def __init__(self, url: str):
+        self.engine: AsyncEngine = create_async_engine(
+            url,
+            echo=False,
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=20
+        )
+        self.session_maker = async_sessionmaker(
+            self.engine,
+            class_=AsyncSession,
+            expire_on_commit=False
+        )
+    
+    async def create_tables(self):
+        """Создать все таблицы"""
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            logger.info("Таблицы БД созданы")
+    
+    async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
+        """Получить сессию БД"""
+        async with self.session_maker() as session:
+            try:
+                yield session
+            except Exception as e:
+                await session.rollback()
+                logger.error(f"Ошибка сессии БД: {e}")
+                raise
+            finally:
+                await session.close()
+
+
+db = Database(settings.DATABASE_URL)
+
+=== bot/config.py ===
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file='.env',
+        env_file_encoding='utf-8',
+        extra='ignore'
+    )
+    
+    # Telegram
+    BOT_TOKEN: str
+    ADMIN_IDS: str
+    
+    # Pyrus
+    PYRUS_API_KEY: str
+    PYRUS_API_URL: str = "https://api.pyrus.com/v4"
+    
+    # Database
+    DATABASE_URL: str
+    
+    # Redis
+    REDIS_URL: str = "redis://localhost:6379"
+    
+    # App
+    LOG_LEVEL: str = "INFO"
+    ENVIRONMENT: str = "production"
+    MAX_DESCRIPTION_LENGTH: int = 1000
+    
+    @property
+    def admin_ids_list(self) -> List[int]:
+        return [int(id.strip()) for id in self.ADMIN_IDS.split(',')]
+
+
+settings = Settings()  # type: ignore
